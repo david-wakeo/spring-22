@@ -2,10 +2,10 @@ import sys
 import math
 import time
 from functools import cached_property
-from typing import List, Generator, Set, Type
+from typing import List, Generator, Set, Type, Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
-from itertools import combinations, chain, product
+from itertools import combinations, chain, product, groupby
 
 # Various utils
 def debug(something):
@@ -65,10 +65,7 @@ class Position:
         )
 
     def symetric_position(self) -> "Position":
-        return Position(
-            Position.MAX_X - self.x,
-            Position.MAX_Y - self.y
-        )
+        return Position(Position.MAX_X - self.x, Position.MAX_Y - self.y)
 
 
 LEFT_BASE_POSITION = Position(Position.MIN_X, Position.MIN_Y)
@@ -168,6 +165,7 @@ class MoveAction(Action):
     def action_message(self) -> str:
         return f"MOVE {self.position.x} {self.position.y}"
 
+
 @dataclass
 class AttackAction(MoveAction):
     target: "Monster"
@@ -176,28 +174,44 @@ class AttackAction(MoveAction):
     def debug_message(self) -> str:
         return f"{self.attack_type} {self.target.id}"
 
+
 @dataclass
 class KillAction(AttackAction):
     attack_type: str = "Kill"
+
 
 @dataclass
 class SoftenAction(AttackAction):
     attack_type: str = "Soften"
 
+
 @dataclass
 class FarmAction(AttackAction):
     attack_type: str = "Farm"
 
+
 @dataclass
-class SpellShieldAction(Action):
+class TargetedSpellAction(Action):
     target: "Entity"
 
+    TARGETED_SPELL_RANGE = 2200
+
+    @property
+    def legal(self) -> bool:
+        return (
+            self.actor.position.distance_to(self.target.position)
+            <= TargetedSpellAction.TARGETED_SPELL_RANGE
+        )
+
+
+@dataclass
+class SpellShieldAction(TargetedSpellAction):
     def action_message(self) -> str:
         return f"SPELL SHIELD {self.target.id}"
 
 
 @dataclass
-class SpellControlAction(Action):
+class SpellControlAction(TargetedSpellAction):
     target: "Entity"
     position: Position
 
@@ -226,6 +240,8 @@ class Entity:
     vy: int
     near_base: int
     threat_for: int
+
+    Selector = Callable[["Entity"], bool]
 
     @classmethod
     def deserialize(cls, str):
@@ -259,6 +275,36 @@ class Entity:
             except AttributeError:
                 pass
 
+    def is_monster(self) -> bool:
+        return False
+
+    def is_hero(self) -> bool:
+        return False
+
+    def is_vilain(self) -> bool:
+        return False
+
+    def controlled(self) -> bool:
+        return bool(self.is_controlled)
+
+    def shielded(self) -> bool:
+        return bool(self.shield_life)
+
+    def targeting_me(self) -> bool:
+        return self.threat_for == 1
+
+    def targeting_other(self) -> bool:
+        return self.threat_for == 2
+
+    def targeting_nobody(self) -> bool:
+        return self.threat_for == 0
+
+    def near_my_base(self) -> bool:
+        return self.near_base == 1
+
+    def near_other_base(self) -> bool:
+        return self.near_base == 2
+
 
 class Hero(Entity):
     SPEED = 800
@@ -280,9 +326,13 @@ class Hero(Entity):
         else:
             return 0
 
+    def is_hero(self) -> bool:
+        return True
+
 
 class Vilain(Entity):
-    pass
+    def is_vilain(self) -> bool:
+        return True
 
 
 class Monster(Entity):
@@ -291,8 +341,7 @@ class Monster(Entity):
     # in theory 300 but theere is a small difference in my computation that mess with it
     RAID_DISTANCE = 400
 
-    @property
-    def is_dangerous(self):
+    def dangerous(self) -> bool:
         return self.threat_for == 1
 
     def infer_move(self):
@@ -338,6 +387,9 @@ class Monster(Entity):
     def nb_turn_within_bounds(self) -> int:
         return len(self.path)
 
+    def is_monster(self) -> bool:
+        return True
+
 
 @dataclass
 class Base:
@@ -345,11 +397,8 @@ class Base:
     health: int = 3
     mana: int = 0
 
-    def infer_opposite_base(self) -> "Base":
-        if self.is_right:
-            return Base(RIGHT_BASE_POSITION)
-        else:
-            return Base(LEFT_BASE_POSITION)
+    def update_from_inputs(self, str):
+        self.health, self.mana = [int(j) for j in str.split()]
 
     @property
     def is_left(self) -> bool:
@@ -364,7 +413,6 @@ class Base:
             return position_relative_to_left_base
         else:
             return position_relative_to_left_base.symetric_position()
-
 
 
 @dataclass
@@ -383,7 +431,7 @@ class Gamestate:
         return [action.actor for action in self.actions]
 
     @property
-    def available_heroes(self):
+    def available_heroes(self) -> List[Hero]:
         return [h for h in self.heroes if h not in self.active_heroes]
 
     @property
@@ -409,8 +457,8 @@ class Gamestate:
             monster.infer_move()
 
     def read_turn_inputs(self) -> None:
-        for i in range(2):
-            health, mana = [int(j) for j in input().split()]
+        self.my_base.update_from_inputs(input())
+        self.evil_base.update_from_inputs(input())
         entity_count = int(input())
         entity_inputs = [input() for i in range(entity_count)]
         received_entities = {
@@ -477,7 +525,9 @@ class MonsterAttack:
 
     @property
     def time_to_reach(self) -> int:
-        return next(turn for turn, damage in enumerate(self.damage_profile) if damage > 0)
+        return next(
+            turn for turn, damage in enumerate(self.damage_profile) if damage > 0
+        )
 
     @property
     def turn_for_kill(self) -> int:
@@ -495,10 +545,9 @@ class MonsterAttack:
     ) -> Generator[MoveAction, None, None]:
         for hero in self.heroes:
             yield self.attack_class(
-                hero,
-                hero.interception(self.monster).target_position,
-                self.monster
+                hero, hero.interception(self.monster).target_position, self.monster
             )
+
 
 # Produce actions relative to a specific objective (eg: defend base, farm, scout, etc.)
 # It is acceptable to produce partial or no actions for a given gamestate if objectives are not reachable
@@ -518,7 +567,10 @@ class AttackMonsterTactic(Tactic):
         allocatable_heroes = gamestate.available_heroes
         for monster in self.target_monsters:
             hero_combinations = all_combinations(allocatable_heroes)
-            attacks = (MonsterAttack(monster, heroes, self.attack_class) for heroes in hero_combinations)
+            attacks = (
+                MonsterAttack(monster, heroes, self.attack_class)
+                for heroes in hero_combinations
+            )
             possible_attacks = [
                 attack for attack in attacks if self.attack_filter(attack)
             ]
@@ -549,7 +601,7 @@ class KillThreateningMonsterTactic(AttackMonsterTactic):
     def target_monsters(self) -> List[Monster]:
         # threatening priorized by time to base
         return sorted(
-            (monster for monster in self.gamestate.monsters if monster.is_dangerous),
+            (monster for monster in self.gamestate.monsters if monster.targeting_me()),
             key=lambda m: m.nb_turn_within_bounds(),
         )
 
@@ -569,9 +621,13 @@ class SoftenThreateningMonsterTactic(AttackMonsterTactic):
     def target_monsters(self) -> List[Monster]:
         # threatening priorized by time to base
         targetted_monsters = {
-            action.target for action in self.gamestate.actions if isinstance(action, AttackAction)
+            action.target
+            for action in self.gamestate.actions
+            if isinstance(action, AttackAction)
         }
-        threatening_monsters = { monster for monster in self.gamestate.monsters if monster.is_dangerous }
+        threatening_monsters = {
+            monster for monster in self.gamestate.monsters if monster.targeting_me()
+        }
         targetable_monsters = list(threatening_monsters - targetted_monsters)
         return sorted(
             targetable_monsters,
@@ -589,6 +645,7 @@ class SoftenThreateningMonsterTactic(AttackMonsterTactic):
     def attack_class(self) -> Type[AttackAction]:
         return SoftenAction
 
+
 # Tactics intended to produce the maximum mana
 # Hero are the primary focus
 class FarmTactic(Tactic):
@@ -599,19 +656,21 @@ class FarmTactic(Tactic):
         allocatable_heroes = gamestate.available_heroes
         targetable_monsters = self.target_monsters
         attack_pairs = product(allocatable_heroes, targetable_monsters)
-        attacks = (MonsterAttack(
-            monster, [hero], FarmAction
-        ) for hero, monster in attack_pairs)
+        attacks = (
+            MonsterAttack(monster, [hero], FarmAction) for hero, monster in attack_pairs
+        )
         possible_attacks = (attack for attack in attacks if self.attack_filter(attack))
         ranked_attacks = sorted(possible_attacks, key=lambda a: self.attack_ranker(a))
         picked_heroes = []
         farmed_monsters = []
         for attack in ranked_attacks:
-            if attack.heroes[0] not in picked_heroes and attack.monster not in farmed_monsters:
+            if (
+                attack.heroes[0] not in picked_heroes
+                and attack.monster not in farmed_monsters
+            ):
                 yield from attack.generate_moves()
                 picked_heroes.append(attack.heroes[0])
                 farmed_monsters.append(attack.monster)
-
 
     @property
     def target_monsters(self) -> List[Monster]:
@@ -623,12 +682,15 @@ class FarmTactic(Tactic):
     def attack_ranker(self, attack: MonsterAttack):
         raise NotImplementedError
 
+
 class FarmNearestMonsterTactic(FarmTactic):
     @property
     def target_monsters(self) -> List[Monster]:
         # threatening priorized by time to base
         targetted_monsters = {
-            action.target for action in self.gamestate.actions if isinstance(action, AttackAction)
+            action.target
+            for action in self.gamestate.actions
+            if isinstance(action, AttackAction)
         }
         targetable_monsters = list(set(gamestate.monsters) - targetted_monsters)
         return targetable_monsters
@@ -639,23 +701,22 @@ class FarmNearestMonsterTactic(FarmTactic):
     def attack_ranker(self, attack: MonsterAttack):
         return attack.time_to_reach
 
+
 # Try to reach a given area
 @dataclass
 class GuardAreaTactic(Tactic):
     positions: List[Position]
     tolerance: int
-    gamestate: Gamestate = field(init = False)
+    gamestate: Gamestate = field(init=False)
 
     BASE_OUTSKIRT_POSITIONS = [
         Position(7200, 2000),
         Position(5600, 4900),
-        Position(2600, 6200)
+        Position(2600, 6200),
     ]
 
     def evaluate(self, gamestate: Gamestate) -> Generator[Action, None, None]:
         self.gamestate = gamestate
-        debug(self.positions)
-        debug(self.guard_positions)
         guard_positions = self.guard_positions
 
         for allocatable_hero in gamestate.available_heroes:
@@ -666,15 +727,76 @@ class GuardAreaTactic(Tactic):
 
     @property
     def guard_positions(self) -> List[Position]:
-        return [
-            self.base.position_for_base(
-                position
-            ) for position in self.positions
-        ]
+        return [self.base.position_for_base(position) for position in self.positions]
 
     @property
     def base(self) -> Base:
         return self.gamestate.my_base
+
+
+# Attempt to cast spell on the maximum of eligible targets with the current available heroes
+# The primary focus is the number of targets allocated
+# (since the priority on entites can be ajusted externally)
+@dataclass
+class TargetedSpellTactic(Tactic):
+    target_selector: Entity.Selector
+    mana_threshold: int
+
+    def evaluate(self, gamestate: Gamestate) -> Generator[Action, None, None]:
+        self.gamestate = gamestate
+        eligible_targets = {
+            entity
+            for entity in gamestate.entities
+            if self.target_selector(entity)
+            and not entity.shielded()
+            and not self.target_restriction(entity)
+        }
+        already_targeted_entities = {
+            spell.target
+            for spell in gamestate.actions
+            if isinstance(spell, TargetedSpellAction)
+        }
+        selectable_targets = list(eligible_targets - already_targeted_entities)
+        allocatable_heroes = gamestate.available_heroes
+        # TODO mana allocation
+        if gamestate.my_base.mana > self.mana_threshold:
+            spell_pairs = product(allocatable_heroes, selectable_targets)
+            spells = (
+                self.make_spell(hero, target, gamestate) for hero, target in spell_pairs
+            )
+            legal_spells = (spell for spell in spells if spell.legal)
+            spells_grouped_by_hero = [
+                list(spells)
+                for hero, spells in groupby(legal_spells, key=lambda s: s.actor)
+            ]
+            spells_by_hero_ascending = sorted(spells_grouped_by_hero, key=len)
+            picked_targets = []
+            for spells in spells_by_hero_ascending:
+                valid_spell = next(
+                    (spell for spell in spells if spell.target not in picked_targets),
+                    None,
+                )
+                if valid_spell:
+                    yield valid_spell
+                    picked_targets.append(valid_spell.target)
+
+    def make_spell(
+        self, hero: Hero, target: Entity, gamestate: Gamestate
+    ) -> TargetedSpellAction:
+        raise NotImplementedError
+
+    def target_restriction(self, entity: Entity) -> bool:
+        return False
+
+
+class SendMonsterToOtherBaseTactic(TargetedSpellTactic):
+    def make_spell(
+        self, hero: Hero, target: Entity, gamestate: Gamestate
+    ) -> TargetedSpellAction:
+        return SpellControlAction(hero, target, gamestate.evil_base.position)
+
+    def target_restriction(self, entity: Entity) -> bool:
+        return not entity.is_monster() or entity.near_my_base() or entity.controlled()
 
 
 class PassiveTactic(Tactic):
@@ -708,9 +830,46 @@ def init_gamestate():
     heroes_per_player = int(input())
     my_base_position = Position(base_x, base_y)
     my_base = Base(position=Position(base_x, base_y))
-    evil_base = my_base.infer_opposite_base()
+    evil_base = Base(position=my_base.position.symetric_position())
     return Gamestate(my_base, evil_base)
 
+
+# Entity selector builder
+class Esb:
+    @staticmethod
+    def _and(*selectors: Entity.Selector) -> Entity.Selector:
+        def combined_selectors(entity) -> bool:
+            return all(selector(entity) for selector in selectors)
+
+        return combined_selectors
+
+    @staticmethod
+    def min_health(health: int) -> Entity.Selector:
+        def selector(entity) -> bool:
+            return entity.health >= health
+
+        return selector
+
+    @staticmethod
+    def _not(selector: Entity.Selector) -> Entity.Selector:
+        def opposite_selector(entity) -> bool:
+            return opposite_selector(entity)
+
+        return opposite_selector
+
+
+# Meta tactics
+ControlThreateningMonsterTactic = SendMonsterToOtherBaseTactic(
+    target_selector=Esb._and(Esb.min_health(12), Entity.targeting_me),
+    mana_threshold=30,  # might not work below
+)
+ControlNeutralMonsterTactic = SendMonsterToOtherBaseTactic(
+    target_selector=Esb._and(
+        Esb.min_health(16),
+        Entity.targeting_nobody,
+    ),
+    mana_threshold=100,
+)
 
 # Strategy definition
 # Defensive strategy aiming to maximize mana and map awareness as second objective.
@@ -718,12 +877,21 @@ def init_gamestate():
 # game strategies
 farm_strategy = PriorityStrategy(
     tactics=[
+        ControlThreateningMonsterTactic,
+        ControlNeutralMonsterTactic,
         KillThreateningMonsterTactic(),
         SoftenThreateningMonsterTactic(),
         GuardAreaTactic(GuardAreaTactic.BASE_OUTSKIRT_POSITIONS, 2000),
         FarmNearestMonsterTactic(),
         GuardAreaTactic(GuardAreaTactic.BASE_OUTSKIRT_POSITIONS, 0),
         PassiveTactic(),
+    ]
+)
+
+late_game_strategy = PriorityStrategy(
+    tactics=[
+        ControlThreateningMonsterTactic,
+        ControlNeutralMonsterTactic,
     ]
 )
 
