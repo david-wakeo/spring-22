@@ -2,10 +2,12 @@ import sys
 import math
 import time
 from functools import cached_property
-from typing import List, Generator, Set, Type, Callable
+from typing import List, Generator, Set, Type, Callable, ClassVar
 from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import combinations, chain, product, groupby
+from contextlib import contextmanager
+from copy import copy
 
 # Various utils
 def debug(something):
@@ -27,6 +29,20 @@ def timeit(func):
 # [1 2 3] => [1] [2] [3] [1, 2] [1, 3] [2, 3] [1, 2 ,3]
 def all_combinations(array):
     return chain(*(list(combinations(array, i + 1)) for i in range(len(array))))
+
+
+# generate all possibles and valid allocations combinations
+# this is usefull to evaluate the optimal allocation of resources for a given problem
+def generate_pairs_combinations(a, b) -> Generator:
+    pairs = product(a, b)
+    max_distinct_pairs = min(len(a), len(b))
+    pairs_combinations = combinations(pairs, max_distinct_pairs)
+    valid_pairs_combinations = (
+        pairs_combination
+        for pairs_combination in pairs_combinations
+        if len(set(chain.from_iterable(pairs_combination))) == max_distinct_pairs * 2
+    )
+    return valid_pairs_combinations
 
 
 # Data for solving
@@ -83,7 +99,7 @@ class Vector:
 
     @property
     def magnitude(self) -> int:
-        return int(math.sqrt(self.dx**2 + self.dy**2))
+        return int(math.sqrt(self.dx ** 2 + self.dy ** 2))
 
     def normalize(self, norm: int) -> "Vector":
         normalization_factor = norm / self.magnitude
@@ -223,8 +239,10 @@ class SpellControlAction(TargetedSpellAction):
 class SpellWindAction(Action):
     position: Position
 
+    AOE_RADIUS = 1280
+
     def action_message(self) -> str:
-        return f"SPELL WIND #{self.position.x} {self.position.y}"
+        return f"SPELL WIND {self.position.x} {self.position.y}"
 
 
 @dataclass
@@ -305,6 +323,9 @@ class Entity:
     def near_other_base(self) -> bool:
         return self.near_base == 2
 
+    def within_range(self, others: List["Entity"], radius) -> List["Entity"]:
+        return [e for e in others if e.position.distance_to(self.position) <= radius]
+
 
 class Hero(Entity):
     SPEED = 800
@@ -325,6 +346,9 @@ class Hero(Entity):
             return (turn - self.time_to_reach(monster)) * Hero.DAMAGE
         else:
             return 0
+
+    def can_kill(self, monster: "Monster") -> bool:
+        return MonsterAttack(monster, [self]).is_lethal
 
     def is_hero(self) -> bool:
         return True
@@ -355,10 +379,7 @@ class Monster(Entity):
             targetting_base = bool(self.near_base)
             current_vector = Vector(self.vx, self.vy)
 
-            while current_position.within_bounds() or (
-                targetting_base
-                and not current_position.near_any_base(Monster.RAID_DISTANCE)
-            ):
+            while current_position.within_bounds():
                 current_position = current_position.with_vector(current_vector)
                 if (
                     current_position.distance_to(LEFT_BASE_POSITION)
@@ -390,6 +411,10 @@ class Monster(Entity):
     def is_monster(self) -> bool:
         return True
 
+    @property
+    def robustness(self) -> float:
+        return self.health / self.nb_turn_within_bounds()
+
 
 @dataclass
 class Base:
@@ -414,6 +439,9 @@ class Base:
         else:
             return position_relative_to_left_base.symetric_position()
 
+    def within_range(self, entity: Entity, radius: int) -> bool:
+        return self.position.distance_to(entity.position) <= radius
+
 
 @dataclass
 class Gamestate:
@@ -424,6 +452,7 @@ class Gamestate:
     heroes: List[Hero] = field(default_factory=list)
     vilains: List[Vilain] = field(default_factory=list)
     monsters: List[Monster] = field(default_factory=list)
+    turn: int = 0
 
     # Accessors
     @property
@@ -432,7 +461,37 @@ class Gamestate:
 
     @property
     def available_heroes(self) -> List[Hero]:
-        return [h for h in self.heroes if h not in self.active_heroes]
+        return list(
+            set(self.heroes) - set(self.active_heroes) - set(self.controlled_heroes)
+        )
+
+    @property
+    def controlled_heroes(self) -> List[Hero]:
+        return [h for h in self.heroes if h.is_controlled]
+
+    @property
+    def entities_targetable_by_vilains(self) -> List[Entity]:
+        if self.vilains:
+            return [
+                e
+                for e in self.entities
+                if min(
+                    (e.position.distance_to(vilain.position) for vilain in self.vilains)
+                )
+                <= TargetedSpellAction.TARGETED_SPELL_RANGE
+            ]
+        else:
+            return []
+
+    # allow to restrict the list of heroes active
+    @contextmanager
+    def with_allowed_heroes(self, allowed_heroes: List[Hero]):
+        original_heroes = copy(self.heroes)  # probably not necessary
+        self.heroes = list(set(original_heroes) & set(allowed_heroes))
+        try:
+            yield
+        finally:
+            self.heroes = original_heroes
 
     @property
     def turn_actions(self):
@@ -441,6 +500,7 @@ class Gamestate:
 
     # New turn logic
     def begin_new_turn(self):
+        self.turn += 1
         self.resolve_actions()
         self.infer_monster_positions()
         self.read_turn_inputs()
@@ -460,8 +520,8 @@ class Gamestate:
         self.my_base.update_from_inputs(input())
         self.evil_base.update_from_inputs(input())
         entity_count = int(input())
-        entity_inputs = [input() for i in range(entity_count)]
-        received_entities = {
+        entity_inputs = [input() for _ in range(entity_count)]
+        received_entities: Set[Entity] = {
             Entity.deserialize(entity_input) for entity_input in entity_inputs
         }
         self.update_entities(received_entities)
@@ -553,7 +613,7 @@ class MonsterAttack:
 # It is acceptable to produce partial or no actions for a given gamestate if objectives are not reachable
 # nor relevant
 class Tactic:
-    def evaluate(self, gamestate: Gamestate) -> Generator[Action, None, None]:
+    def evaluate(self, _gamestate: Gamestate) -> Generator[Action, None, None]:
         raise NotImplementedError
 
 
@@ -580,6 +640,11 @@ class AttackMonsterTactic(Tactic):
                 allocatable_heroes = list(
                     set(allocatable_heroes) - set(best_attack.heroes)
                 )
+            else:
+                # This means we can not kill with certainty the highest theat
+                # we whould still try to do something about it but with other methods
+                # Anyway the other heroes should not try to intercept lesser threat
+                return
 
     @property
     def target_monsters(self) -> List[Monster]:
@@ -646,6 +711,15 @@ class SoftenThreateningMonsterTactic(AttackMonsterTactic):
         return SoftenAction
 
 
+# monster farm should find the path that maximize the mana gained
+# each hero do a step in direction of a monster
+# a* with heuristic
+# hero, monsters,
+
+
+# compute overlap on a given turn (if i dont remove monster, this is easy, if i do i must simulate) if i simulate the
+
+
 # Tactics intended to produce the maximum mana
 # Hero are the primary focus
 class FarmTactic(Tactic):
@@ -709,12 +783,6 @@ class GuardAreaTactic(Tactic):
     tolerance: int
     gamestate: Gamestate = field(init=False)
 
-    BASE_OUTSKIRT_POSITIONS = [
-        Position(7200, 2000),
-        Position(5600, 4900),
-        Position(2600, 6200),
-    ]
-
     def evaluate(self, gamestate: Gamestate) -> Generator[Action, None, None]:
         self.gamestate = gamestate
         guard_positions = self.guard_positions
@@ -767,7 +835,7 @@ class TargetedSpellTactic(Tactic):
             legal_spells = (spell for spell in spells if spell.legal)
             spells_grouped_by_hero = [
                 list(spells)
-                for hero, spells in groupby(legal_spells, key=lambda s: s.actor)
+                for _, spells in groupby(legal_spells, key=lambda s: s.actor)
             ]
             spells_by_hero_ascending = sorted(spells_grouped_by_hero, key=len)
             picked_targets = []
@@ -801,8 +869,207 @@ class SendMonsterToOtherBaseTactic(TargetedSpellTactic):
 
 class PassiveTactic(Tactic):
     def evaluate(self, gamestate: Gamestate) -> Generator[Action, None, None]:
-        for hero in gamestate.available_heroes:
+        for hero in gamestate.controlled_heroes:
             yield (WaitAction(hero))
+
+
+class ShieldSelfTactic(Tactic):
+    opfor_use_mindcontrol: ClassVar[bool] = False
+
+    def evaluate(self, gamestate: Gamestate) -> Generator[Action, None, None]:
+        entities_within_vilain_control_range = gamestate.entities_targetable_by_vilains
+        vulnerable_heroes = (
+            hero
+            for hero in gamestate.available_heroes
+            if not hero.shielded() and hero in entities_within_vilain_control_range
+        )
+        ShieldSelfTactic.opfor_use_mindcontrol = (
+            ShieldSelfTactic.opfor_use_mindcontrol
+            or any(hero for hero in gamestate.heroes if hero.controlled())
+        )
+        if ShieldSelfTactic.opfor_use_mindcontrol:
+            for hero in vulnerable_heroes:
+                yield (SpellShieldAction(hero, hero))
+
+
+class ShieldThreateningMonsterTactic(Tactic):
+    def evaluate(self, gamestate: Gamestate) -> Generator[Action, None, None]:
+        if not gamestate.available_heroes:
+            return
+        # in theory there may be several but in practice this is a mono strategy
+        # if I need another hero, I'll add an allocation logic
+        eligible_hero = gamestate.available_heroes[0]
+        debug(gamestate.monsters)
+        eligible_monsters = [
+            monster
+            for monster in gamestate.monsters
+            if monster.targeting_other()
+            # and monster.near_other_base()
+            and not monster.shielded() and monster.health > 16
+        ]
+        debug(eligible_monsters)
+        ranked_eligible_monsters = sorted(
+            eligible_monsters, key=lambda m: m.robustness, reverse=True
+        )
+        debug(ranked_eligible_monsters)
+        best_target = next(
+            (
+                monster
+                for monster in ranked_eligible_monsters
+                if monster.within_range(
+                    [eligible_hero], TargetedSpellAction.TARGETED_SPELL_RANGE
+                )
+            ),
+            None,
+        )
+        if best_target:
+            yield SpellShieldAction(eligible_hero, best_target)
+
+
+class DefensiveWindTactic(Tactic):
+    def evaluate(self, gamestate: Gamestate) -> Generator[Action, None, None]:
+        dangerous_eligible_monsters: Generator[Monster, None, None] = (
+            e
+            for e in gamestate.entities
+            if e.is_monster()
+            and gamestate.my_base.within_range(e, 3000)
+            and e.targeting_me()
+            and not e.shielded()
+        )
+        # actually several hero may have killed it but this is dangerous because a wind could seal the deal
+        # we may use slightly more wind that required but better be safe than sorry
+        unkillable_eligible_monsters = [
+            m
+            for m in dangerous_eligible_monsters
+            if not any(hero.can_kill(m) for hero in gamestate.available_heroes)
+        ]
+        potential_savior_heroes = [
+            hero
+            for hero in gamestate.available_heroes
+            if any(
+                hero.within_range(
+                    unkillable_eligible_monsters, SpellWindAction.AOE_RADIUS
+                )
+            )
+        ]
+        if potential_savior_heroes:
+            best_savior = max(
+                potential_savior_heroes,
+                key=lambda h: len(
+                    h.within_range(
+                        unkillable_eligible_monsters, SpellWindAction.AOE_RADIUS
+                    )
+                ),
+            )
+            yield SpellWindAction(
+                best_savior,
+                gamestate.evil_base.position,
+            )
+
+
+# Entity selector builder
+class Esb:
+    @staticmethod
+    def _and(*selectors: Entity.Selector) -> Entity.Selector:
+        def combined_selectors(entity) -> bool:
+            return all(selector(entity) for selector in selectors)
+
+        return combined_selectors
+
+    @staticmethod
+    def min_health(health: int) -> Entity.Selector:
+        def selector(entity) -> bool:
+            return entity.health >= health
+
+        return selector
+
+    @staticmethod
+    def _not(selector: Entity.Selector) -> Entity.Selector:
+        def opposite_selector(entity) -> bool:
+            return not selector(entity)
+
+        return opposite_selector
+
+
+# Meta tactics
+ControlThreateningMonsterTactic = SendMonsterToOtherBaseTactic(
+    target_selector=Esb._and(Esb.min_health(12), Entity.targeting_me),
+    mana_threshold=30,
+)
+ControlNeutralMonsterTactic = SendMonsterToOtherBaseTactic(
+    target_selector=Esb._and(
+        Esb.min_health(16),
+        Entity.targeting_nobody,
+    ),
+    mana_threshold=100,
+)
+
+# A role represents a set of Rules an actor should follow.
+# Each rule is evaluated sequentially until all allocated heroes are staffed.
+# Same roles are evaluated simultenaously.
+# Targets and objectives allocation are therefore shared and can be optimized.
+#
+# Roles are allocated to heroes based on proximity according to its specified position
+@dataclass
+class Role:
+    position: Position
+    leeway: int = 2000
+
+    @property
+    def tactics(self) -> List[Tactic]:
+        raise NotImplementedError
+
+    # what the hero should do if none actions are applicable
+    @property
+    def idle_tactic(self) -> Tactic:
+        return FarmNearestMonsterTactic()
+
+    def __hash__(self) -> int:
+        return hash(self.__class__.__name__ + f"{self.position}")
+
+
+class DefenderRole(Role):
+    TOP_POSITION = Position(7200, 2000)
+    MIDDLE_POSITION = Position(5600, 4900)
+    BOTTOM_POSITION = Position(2600, 6200)
+    INNER_POSITION = Position(3000, 2500)
+
+    @property
+    def tactics(self) -> List[Tactic]:
+        return [
+            ShieldSelfTactic(),
+            DefensiveWindTactic(),
+            ControlThreateningMonsterTactic,
+            ControlNeutralMonsterTactic,
+            KillThreateningMonsterTactic(),
+            SoftenThreateningMonsterTactic(),
+        ]
+
+
+class DisruptorRole(Role):
+    MIDDLE_POSITION = Position(13000, 6000)
+
+    @property
+    def tactics(self) -> List[Tactic]:
+        return [
+            ShieldThreateningMonsterTactic(),
+            ControlNeutralMonsterTactic,
+        ]
+
+
+@dataclass
+class Mission:
+    role: Role
+    hero: Hero
+    my_base: Base
+
+    @property
+    def fitness(self) -> int:
+        return 20000 - int(
+            self.hero.position.distance_to(
+                self.my_base.position_for_base(self.role.position)
+            )
+        )
 
 
 # Produce actions for the current turn of a given gamestate by defining the applicable tactics set and how
@@ -825,6 +1092,62 @@ class PriorityStrategy(Strategy):
             gamestate.actions += actions
 
 
+@dataclass
+class RoleBasedStrategy(Strategy):
+    roles: List[Role]
+
+    def apply(self, gamestate: Gamestate):
+        missions = self.allocate_missions(gamestate)
+        grouped_missions_by_role = groupby(missions, key=lambda m: m.role.__class__)
+        for _, missions in grouped_missions_by_role:
+            missions = list(missions)
+            with gamestate.with_allowed_heroes([mission.hero for mission in missions]):
+                PriorityStrategy(self.tactics_for(missions)).apply(gamestate)
+
+    def allocate_missions(self, gamestate: Gamestate) -> List[Mission]:
+        pairs_combinations = generate_pairs_combinations(gamestate.heroes, self.roles)
+        missions_combinations = (
+            [Mission(hero, role, gamestate.my_base) for role, hero in pairs_combination]
+            for pairs_combination in pairs_combinations
+        )
+        best_mission_combination = max(
+            missions_combinations,
+            key=lambda mission_combination: sum(
+                mission.fitness for mission in mission_combination
+            ),
+        )
+        return best_mission_combination
+
+    def tactics_for(self, missions: List[Mission]) -> List[Tactic]:
+        roles = [mission.role for mission in missions]
+        role_positions = [role.position for role in roles]
+        role = roles[0]
+        return [
+            *role.tactics,
+            GuardAreaTactic(role_positions, role.leeway),
+            role.idle_tactic,
+            GuardAreaTactic(role_positions, 0),
+            PassiveTactic(),
+        ]
+
+
+basic_strategy = RoleBasedStrategy(
+    roles=[
+        DefenderRole(DefenderRole.MIDDLE_POSITION),
+        DefenderRole(DefenderRole.TOP_POSITION),
+        DefenderRole(DefenderRole.BOTTOM_POSITION),
+    ]
+)
+
+late_strategy = RoleBasedStrategy(
+    roles=[
+        DefenderRole(DefenderRole.INNER_POSITION, 2000),
+        DefenderRole(DefenderRole.MIDDLE_POSITION, 1500),
+        DisruptorRole(DisruptorRole.MIDDLE_POSITION, 1500),
+    ]
+)
+
+
 def init_gamestate():
     base_x, base_y = [int(i) for i in input().split()]
     heroes_per_player = int(input())
@@ -834,73 +1157,22 @@ def init_gamestate():
     return Gamestate(my_base, evil_base)
 
 
-# Entity selector builder
-class Esb:
-    @staticmethod
-    def _and(*selectors: Entity.Selector) -> Entity.Selector:
-        def combined_selectors(entity) -> bool:
-            return all(selector(entity) for selector in selectors)
-
-        return combined_selectors
-
-    @staticmethod
-    def min_health(health: int) -> Entity.Selector:
-        def selector(entity) -> bool:
-            return entity.health >= health
-
-        return selector
-
-    @staticmethod
-    def _not(selector: Entity.Selector) -> Entity.Selector:
-        def opposite_selector(entity) -> bool:
-            return opposite_selector(entity)
-
-        return opposite_selector
-
-
-# Meta tactics
-ControlThreateningMonsterTactic = SendMonsterToOtherBaseTactic(
-    target_selector=Esb._and(Esb.min_health(12), Entity.targeting_me),
-    mana_threshold=30,  # might not work below
-)
-ControlNeutralMonsterTactic = SendMonsterToOtherBaseTactic(
-    target_selector=Esb._and(
-        Esb.min_health(16),
-        Entity.targeting_nobody,
-    ),
-    mana_threshold=100,
-)
-
-# Strategy definition
-# Defensive strategy aiming to maximize mana and map awareness as second objective.
-# This may be enough against bad bot otherwise this is an early game strategy setting fundation for late
-# game strategies
-farm_strategy = PriorityStrategy(
-    tactics=[
-        ControlThreateningMonsterTactic,
-        ControlNeutralMonsterTactic,
-        KillThreateningMonsterTactic(),
-        SoftenThreateningMonsterTactic(),
-        GuardAreaTactic(GuardAreaTactic.BASE_OUTSKIRT_POSITIONS, 2000),
-        FarmNearestMonsterTactic(),
-        GuardAreaTactic(GuardAreaTactic.BASE_OUTSKIRT_POSITIONS, 0),
-        PassiveTactic(),
-    ]
-)
-
-late_game_strategy = PriorityStrategy(
-    tactics=[
-        ControlThreateningMonsterTactic,
-        ControlNeutralMonsterTactic,
-    ]
-)
-
 # game loop
 gamestate = init_gamestate()
 while True:
     gamestate.begin_new_turn()
     # gamestate.print_state()
-    farm_strategy.apply(gamestate)
+    if gamestate.turn <= 80:
+        strategy = basic_strategy
+    else:
+        strategy = late_strategy
+    strategy.apply(gamestate)
     for action in gamestate.turn_actions:
         debug(action)
         action.perform()
+
+
+# soften should allocate only one hero (more if there are more heroes)
+# farm should attempt to target cluster
+# farm should be more intelligent (rank controlled target as last possible target)
+# scout strategy
